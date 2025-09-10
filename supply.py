@@ -12,7 +12,10 @@ import re
 import hashlib
 import argparse
 import sys
+import ipaddress
+import socket
 from urllib.parse import urlparse, urljoin
+from urllib.robotparser import RobotFileParser
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional
 import logging
@@ -27,12 +30,22 @@ logger = logging.getLogger(__name__)
 class NPMAttackDetector:
     """Main detector class for identifying compromised npm packages in web applications"""
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, rate_limit: float = 0.5, max_pages: int = 20, 
+                 check_robots: bool = True, allow_redirects: bool = True):
         self.verbose = verbose
+        self.rate_limit = rate_limit  # Delay between requests in seconds
+        self.max_pages = max_pages  # Maximum number of pages to scan
+        self.check_robots = check_robots  # Whether to check robots.txt
+        self.allow_redirects = allow_redirects  # Whether to follow redirects
+        self.pages_scanned = 0  # Counter for pages scanned
+        self.last_request_time = 0  # Track last request time for rate limiting
+        self.robots_cache = {}  # Cache for robots.txt parsers
+        
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'ChalkGuard/0.1 (NPM Security Scanner; +https://github.com/ballance/ChalkGuard)'
         })
+        self.session.max_redirects = 3  # Limit redirect chains
         
         # Compromised packages and versions
         self.compromised_packages = {
@@ -176,6 +189,199 @@ class NPMAttackDetector:
             'end': datetime(2025, 9, 8, 19, 59)      # UTC
         }
 
+    def _validate_url(self, url: str) -> Tuple[bool, str]:
+        """Validate URL to prevent SSRF attacks
+        Returns: (is_valid, error_message)
+        """
+        try:
+            parsed = urlparse(url)
+            
+            # Check for supported schemes
+            if parsed.scheme not in ['http', 'https']:
+                msg = f"Unsupported scheme: {parsed.scheme}"
+                logger.warning(msg)
+                return False, msg
+            
+            # Get hostname
+            hostname = parsed.hostname
+            if not hostname:
+                msg = "No hostname found in URL"
+                logger.warning(msg)
+                return False, msg
+            
+            # Block localhost and loopback addresses
+            if hostname.lower() in ['localhost', 'localhost.localdomain']:
+                msg = "Cannot scan localhost (security restriction)"
+                logger.warning(msg)
+                return False, msg
+            
+            # Resolve hostname to IP
+            try:
+                # First, try to resolve the hostname
+                logger.debug(f"Resolving hostname: {hostname}")
+                ip_str = socket.gethostbyname(hostname)
+                logger.debug(f"Resolved {hostname} to {ip_str}")
+                ip = ipaddress.ip_address(ip_str)
+                
+                # Block private IP ranges (RFC 1918)
+                if ip.is_private:
+                    msg = f"Cannot scan private IP address: {ip} (security restriction)"
+                    logger.warning(msg)
+                    return False, msg
+                
+                # Block loopback addresses
+                if ip.is_loopback:
+                    msg = f"Cannot scan loopback IP: {ip} (security restriction)"
+                    logger.warning(msg)
+                    return False, msg
+                
+                # Block link-local addresses
+                if ip.is_link_local:
+                    msg = f"Cannot scan link-local IP: {ip} (security restriction)"
+                    logger.warning(msg)
+                    return False, msg
+                
+                # Block multicast addresses
+                if ip.is_multicast:
+                    msg = f"Cannot scan multicast IP: {ip} (security restriction)"
+                    logger.warning(msg)
+                    return False, msg
+                
+                # Block reserved addresses
+                if ip.is_reserved:
+                    msg = f"Cannot scan reserved IP: {ip} (security restriction)"
+                    logger.warning(msg)
+                    return False, msg
+                    
+            except socket.gaierror as e:
+                msg = f"Site not found: Could not resolve hostname '{hostname}' (DNS lookup failed)"
+                logger.warning(msg)
+                return False, msg
+            except socket.timeout:
+                msg = f"DNS lookup timeout for hostname: {hostname}"
+                logger.warning(msg)
+                return False, msg
+            
+            return True, "OK"
+            
+        except Exception as e:
+            msg = f"Error validating URL: {e}"
+            logger.error(msg)
+            return False, msg
+    
+    def _check_robots_txt(self, url: str) -> bool:
+        """Check if URL is allowed according to robots.txt"""
+        if not self.check_robots:
+            return True
+        
+        try:
+            parsed = urlparse(url)
+            robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+            
+            # Check cache first
+            if robots_url in self.robots_cache:
+                rp = self.robots_cache[robots_url]
+            else:
+                # Create new parser
+                rp = RobotFileParser()
+                rp.set_url(robots_url)
+                
+                # Try to read robots.txt with timeout
+                try:
+                    rp.read()
+                    self.robots_cache[robots_url] = rp
+                except:
+                    # If can't read robots.txt, assume allowed
+                    return True
+            
+            # Check if our user agent is allowed
+            user_agent = self.session.headers.get('User-Agent', '*')
+            return rp.can_fetch(user_agent, url)
+            
+        except Exception as e:
+            logger.debug(f"Error checking robots.txt: {e}")
+            # If error, be conservative and allow
+            return True
+    
+    def _apply_rate_limit(self):
+        """Apply rate limiting between requests"""
+        if self.rate_limit > 0:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            
+            if time_since_last < self.rate_limit:
+                sleep_time = self.rate_limit - time_since_last
+                logger.debug(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
+    
+    def _safe_request(self, url: str, **kwargs) -> Optional[requests.Response]:
+        """Make a safe HTTP request with validation and rate limiting"""
+        # Validate URL
+        is_valid, error_msg = self._validate_url(url)
+        if not is_valid:
+            logger.warning(f"URL validation failed for {url}: {error_msg}")
+            return None
+        
+        # Check robots.txt
+        if not self._check_robots_txt(url):
+            logger.warning(f"Robots.txt disallows scanning: {url}")
+            return None
+        
+        # Apply rate limiting
+        self._apply_rate_limit()
+        
+        # Set default timeout if not specified
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 10
+        
+        # Handle redirects securely
+        if not self.allow_redirects:
+            kwargs['allow_redirects'] = False
+        else:
+            # Use custom redirect handling
+            kwargs['allow_redirects'] = False
+            response = self.session.get(url, **kwargs)
+            
+            # Manually handle redirects with validation
+            redirect_count = 0
+            while response.is_redirect and redirect_count < 3:
+                redirect_url = response.headers.get('Location')
+                if not redirect_url:
+                    break
+                
+                # Make redirect URL absolute
+                redirect_url = urljoin(url, redirect_url)
+                
+                # Validate redirect destination
+                is_valid, error_msg = self._validate_url(redirect_url)
+                if not is_valid:
+                    logger.warning(f"Blocking redirect to unsafe URL {redirect_url}: {error_msg}")
+                    break
+                
+                # Check if redirect is to same domain
+                original_domain = urlparse(url).netloc
+                redirect_domain = urlparse(redirect_url).netloc
+                
+                if original_domain != redirect_domain:
+                    logger.warning(f"Blocking cross-domain redirect from {original_domain} to {redirect_domain}")
+                    break
+                
+                # Follow the redirect
+                self._apply_rate_limit()
+                response = self.session.get(redirect_url, **kwargs)
+                redirect_count += 1
+                url = redirect_url
+            
+            return response
+        
+        try:
+            return self.session.get(url, **kwargs)
+        except Exception as e:
+            logger.error(f"Request failed for {url}: {e}")
+            return None
+    
     def scan_url(self, url: str) -> Dict:
         """Scan a website URL for compromised packages"""
         results = {
@@ -197,10 +403,25 @@ class NPMAttackDetector:
             'recommendations': []
         }
         
+        # Check page limit
+        if self.pages_scanned >= self.max_pages:
+            logger.warning(f"Reached maximum page limit ({self.max_pages}). Skipping {url}")
+            results['error'] = 'Page limit reached'
+            return results
+        
+        self.pages_scanned += 1
+        
         try:
             # Normalize URL
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
+            
+            # Validate URL before proceeding
+            is_valid, error_msg = self._validate_url(url)
+            if not is_valid:
+                results['error'] = error_msg
+                logger.warning(f"Skipping invalid URL {url}: {error_msg}")
+                return results
             
             parsed_url = urlparse(url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -267,8 +488,8 @@ class NPMAttackDetector:
     def _check_package_json(self, base_url: str) -> Optional[Dict]:
         """Check if package.json is exposed"""
         try:
-            resp = self.session.get(f"{base_url}/package.json", timeout=5)
-            if resp.status_code == 200:
+            resp = self._safe_request(f"{base_url}/package.json", timeout=5)
+            if resp and resp.status_code == 200:
                 return resp.json()
         except:
             pass
@@ -351,8 +572,8 @@ class NPMAttackDetector:
             ]
             
             for path in paths:
-                resp = self.session.get(f"{base_url}{path}", timeout=3)
-                if resp.status_code == 200:
+                resp = self._safe_request(f"{base_url}{path}", timeout=3)
+                if resp and resp.status_code == 200:
                     return True
         except:
             pass
@@ -362,8 +583,8 @@ class NPMAttackDetector:
         """Scan HTML page for JavaScript file references"""
         js_files = []
         try:
-            resp = self.session.get(url, timeout=10)
-            if resp.status_code == 200:
+            resp = self._safe_request(url, timeout=10)
+            if resp and resp.status_code == 200:
                 # Find script tags
                 script_pattern = r'<script[^>]*src=["\']([^"\']+)["\']'
                 scripts = re.findall(script_pattern, resp.text, re.IGNORECASE)
@@ -400,8 +621,8 @@ class NPMAttackDetector:
         }
         
         try:
-            resp = self.session.get(js_url, timeout=10)
-            if resp.status_code == 200:
+            resp = self._safe_request(js_url, timeout=10)
+            if resp and resp.status_code == 200:
                 content = resp.text
                 
                 # Check for malware signatures
@@ -641,8 +862,9 @@ class NPMAttackDetector:
     def _check_path(self, base_url: str, path: str) -> Optional[str]:
         """Check if a path exists and return content"""
         try:
-            resp = self.session.get(f"{base_url}{path}", timeout=5)
-            if resp.status_code == 200:
+            full_url = f"{base_url}{path}"
+            resp = self._safe_request(full_url, timeout=5)
+            if resp and resp.status_code == 200:
                 return resp.text[:100000]  # Limit to first 100k chars
         except:
             pass
@@ -886,8 +1108,8 @@ class NPMAttackDetector:
         links = set()
         
         try:
-            resp = self.session.get(url, timeout=10)
-            if resp.status_code != 200:
+            resp = self._safe_request(url, timeout=10)
+            if not resp or resp.status_code != 200:
                 return []
             
             # Parse base URL for domain comparison
@@ -963,9 +1185,13 @@ class NPMAttackDetector:
             links_to_scan = self._extract_page_links(url)
             logger.info(f"Found {len(links_to_scan)} same-domain links to scan")
         
-        # Scan each link
-        for idx, link in enumerate(links_to_scan[:20], 1):  # Limit to 20 links to avoid too long scans
-            logger.info(f"Scanning linked page {idx}/{min(len(links_to_scan), 20)}: {link}")
+        # Scan each link (respecting max_pages limit)
+        max_links = min(self.max_pages - 1, 20)  # -1 because main page counts
+        for idx, link in enumerate(links_to_scan[:max_links], 1):
+            if self.pages_scanned >= self.max_pages:
+                logger.info(f"Reached maximum page limit ({self.max_pages})")
+                break
+            logger.info(f"Scanning linked page {idx}/{min(len(links_to_scan), max_links)}: {link}")
             try:
                 link_results = self.scan_url(link)
                 aggregated_results['pages_scanned'].append(link_results)
@@ -1162,8 +1388,8 @@ class NPMAttackDetector:
             for pattern in api_patterns:
                 try:
                     url = f"{base}{pattern}"
-                    resp = self.session.head(url, timeout=3)
-                    if resp.status_code == 200:
+                    resp = self._safe_request(url, timeout=3)
+                    if resp and resp.status_code == 200:
                         content_type = resp.headers.get('content-type', '')
                         if 'javascript' in content_type or 'json' in content_type:
                             additional_resources.append(url)
@@ -1173,8 +1399,8 @@ class NPMAttackDetector:
             # Check for dynamically loaded scripts in initial JS files
             for js_file in initial_js_files[:5]:  # Check first 5 files
                 try:
-                    resp = self.session.get(js_file, timeout=5)
-                    if resp.status_code == 200:
+                    resp = self._safe_request(js_file, timeout=5)
+                    if resp and resp.status_code == 200:
                         # Look for dynamic imports and script loading
                         dynamic_patterns = [
                             r'import\s*\(["\']([^"\']*)["\'\)]',  # Dynamic imports
@@ -1201,7 +1427,10 @@ class NPMAttackDetector:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Detect npm supply chain attack (September 2025) in web applications'
+        description='Detect npm supply chain attack (September 2025) in web applications\n' +
+        'IMPORTANT: Only scan websites you have permission to test.\n' +
+        'This tool is for defensive security purposes only.',
+        epilog='Example: python supply.py https://example.com --max-pages 10 --rate-limit 1.0'
     )
     parser.add_argument('url', help='URL to scan')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
@@ -1209,10 +1438,39 @@ def main():
     parser.add_argument('--batch', help='File containing URLs to scan (one per line)')
     parser.add_argument('--deep', action='store_true', help='Perform deep recursive scanning')
     parser.add_argument('--no-follow', action='store_true', help='Do not follow first-layer links')
+    parser.add_argument('--max-pages', type=int, default=20, help='Maximum number of pages to scan (default: 20)')
+    parser.add_argument('--rate-limit', type=float, default=0.5, help='Delay between requests in seconds (default: 0.5)')
+    parser.add_argument('--no-robots', action='store_true', help='Ignore robots.txt (not recommended)')
+    parser.add_argument('--no-redirects', action='store_true', help='Do not follow HTTP redirects')
+    parser.add_argument('--safe-mode', action='store_true', help='Enable all safety features with conservative settings')
     
     args = parser.parse_args()
     
-    detector = NPMAttackDetector(verbose=args.verbose)
+    # Apply safe mode if requested
+    if args.safe_mode:
+        args.rate_limit = max(args.rate_limit, 1.0)  # At least 1 second between requests
+        args.max_pages = min(args.max_pages, 10)  # Max 10 pages
+        args.no_robots = False  # Always check robots.txt
+        logger.info("Safe mode enabled: rate_limit=1.0s, max_pages=10, robots.txt=enabled")
+    
+    # Show disclaimer
+    print("="*70)
+    print("NPM Supply Chain Attack Detector - Security Notice")
+    print("="*70)
+    print("This tool is for authorized security testing only.")
+    print("Only scan websites you have permission to test.")
+    print(f"Rate limit: {args.rate_limit}s | Max pages: {args.max_pages}")
+    print(f"Robots.txt: {'disabled' if args.no_robots else 'enabled'} | Redirects: {'disabled' if args.no_redirects else 'enabled'}")
+    print("="*70)
+    print()
+    
+    detector = NPMAttackDetector(
+        verbose=args.verbose,
+        rate_limit=args.rate_limit,
+        max_pages=args.max_pages,
+        check_robots=not args.no_robots,
+        allow_redirects=not args.no_redirects
+    )
     
     urls_to_scan = []
     if args.batch:
@@ -1228,6 +1486,25 @@ def main():
     all_results = []
     
     for url in urls_to_scan:
+        # Perform initial DNS check
+        logger.info(f"Checking DNS for {url}...")
+        if not url.startswith(('http://', 'https://')):
+            test_url = 'https://' + url
+        else:
+            test_url = url
+        
+        is_valid, error_msg = detector._validate_url(test_url)
+        if not is_valid:
+            print(f"\n⚠️  ERROR: {error_msg}")
+            print(f"Skipping {url}\n")
+            
+            # Log to appropriate file
+            with open('error_sites.txt', 'a') as f:
+                f.write(f"{url}\n")
+                f.write(f"  Error: {error_msg}\n")
+                f.write(f"  Time: {datetime.utcnow().isoformat()}\n\n")
+            continue
+        
         # Use the new aggregated scanning method
         results = detector.scan_url_with_links(url, follow_links=not args.no_follow)
         all_results.append(results)
@@ -1267,7 +1544,7 @@ def main():
             with open('safe.txt', 'a') as f:
                 f.write(f"{url}\n")
                 f.write(f"  Pages Scanned: {len(results['pages_scanned'])}\n")
-                f.write(f"  Scan Time: {results['scan_time']}\n")
+                f.write(f"  Scan Time: {results.get('scan_time', datetime.utcnow().isoformat())}\n")
                 f.write("\n")
         
         print("\n")
